@@ -18,4 +18,6 @@ The API calls need `Authorization: Bearer <READ_API_KEY>`. Group ids contain `@`
 so URL-encode them (`120363@g.us` becomes `120363%40g.us`).
 
 Environment: `DATABASE_URL`, `WAHA_HMAC_KEY`, `READ_API_KEY` (required);
-`CRM_URL`, `CRM_API_KEY` (optional); `RETENTION_DAYS` (default 90); `PORT` (default 4000).
+`CRM_URL`, `CRM_API_KEY` (optional, enable lead creation for new 1:1 contacts);
+`STORE_DIRECT_CHATS` (default `false`: only group messages are stored; set `true` to also store 1:1 chats);
+`RETENTION_DAYS` (default 90); `PORT` (default 4000).

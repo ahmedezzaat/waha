@@ -13,6 +13,7 @@ const CRM_API_KEY = process.env.CRM_API_KEY;
 const RETENTION_DAYS = Number(process.env.RETENTION_DAYS || 90);
 const MAX_BODY_BYTES = 1024 * 1024;
 const MAX_TEXT_CHARS = 4000;
+const STORE_DIRECT_CHATS = process.env.STORE_DIRECT_CHATS === 'true';
 
 if (!DATABASE_URL || !HMAC_KEY || !READ_API_KEY) {
   console.error('Missing env: DATABASE_URL, WAHA_HMAC_KEY and READ_API_KEY are required');
@@ -150,6 +151,7 @@ async function handleMessageEvent(event, line) {
   if (chatId === 'status@broadcast' || chatId.endsWith('@broadcast')) return 'ignored';
 
   const isGroup = chatId.endsWith('@g.us');
+  if (!isGroup && !STORE_DIRECT_CHATS) return 'ignored';
   const key = (payload._data && payload._data.key) || {};
   const sentAt = new Date((payload.timestamp || Math.floor(Date.now() / 1000)) * 1000);
   const body = clip(payload.body);
@@ -208,7 +210,7 @@ async function handleMessageEvent(event, line) {
     return 'group_message';
   }
 
-  if (!fromMe && senderPhone) {
+  if (!fromMe && senderPhone && CRM_URL && CRM_API_KEY) {
     const lead = await pool.query(
       'INSERT INTO leads (phone) VALUES ($1) ON CONFLICT (phone) DO NOTHING RETURNING phone',
       [senderPhone],
