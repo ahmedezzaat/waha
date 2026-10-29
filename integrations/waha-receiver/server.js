@@ -15,6 +15,10 @@ const MAX_BODY_BYTES = 1024 * 1024;
 const MAX_TEXT_CHARS = 4000;
 const STORE_DIRECT_CHATS = process.env.STORE_DIRECT_CHATS === 'true';
 const ANALYTICS_TZ = process.env.ANALYTICS_TZ || 'Africa/Cairo';
+const WAHA_URL = (process.env.WAHA_URL || 'http://waha:3000').replace(/\/$/, '');
+const WAHA_API_KEY = process.env.WAHA_API_KEY;
+const WAHA_SESSION = process.env.WAHA_SESSION || 'default';
+const SYNC_HOURS = Number(process.env.SYNC_HOURS || 6);
 
 if (!DATABASE_URL || !HMAC_KEY || !READ_API_KEY) {
   console.error('Missing env: DATABASE_URL, WAHA_HMAC_KEY and READ_API_KEY are required');
@@ -55,6 +59,29 @@ CREATE TABLE IF NOT EXISTS daily_group_stats (
   messages integer NOT NULL DEFAULT 0,
   PRIMARY KEY (day, group_id)
 );
+ALTER TABLE groups ADD COLUMN IF NOT EXISTS subject text;
+ALTER TABLE groups ADD COLUMN IF NOT EXISTS size integer;
+ALTER TABLE groups ADD COLUMN IF NOT EXISTS synced_at timestamptz;
+CREATE TABLE IF NOT EXISTS agents (
+  id serial PRIMARY KEY,
+  name text NOT NULL,
+  phone text NOT NULL UNIQUE,
+  lid text,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS lid_map (
+  lid text PRIMARY KEY,
+  phone text NOT NULL,
+  seen_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS lid_map_phone_idx ON lid_map (phone);
+CREATE TABLE IF NOT EXISTS group_members (
+  group_id text NOT NULL,
+  member text NOT NULL,
+  is_admin boolean NOT NULL DEFAULT false,
+  PRIMARY KEY (group_id, member)
+);
+CREATE INDEX IF NOT EXISTS group_members_member_idx ON group_members (member);
 CREATE TABLE IF NOT EXISTS leads (
   phone text PRIMARY KEY,
   created_at timestamptz NOT NULL DEFAULT now()
@@ -178,6 +205,14 @@ async function handleMessageEvent(event, line) {
     senderPhone = firstPhone([payload.from, key.remoteJidAlt, key.senderPn]);
   }
 
+  if (senderJid && senderJid.endsWith('@lid') && senderPhone) {
+    await pool.query(
+      `INSERT INTO lid_map (lid, phone) VALUES ($1, $2)
+       ON CONFLICT (lid) DO UPDATE SET phone = EXCLUDED.phone, seen_at = now()`,
+      [senderJid, senderPhone],
+    );
+  }
+
   if (isGroup) {
     await pool.query(
       'INSERT INTO groups (id, line) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING',
@@ -294,9 +329,9 @@ async function handleApi(req, res, url) {
     const offset = intParam(url, 'offset', 0, 1000000);
     const search = url.searchParams.get('q');
     const result = await pool.query(
-      `SELECT id, name, line, tracked, first_seen_at, last_message_at, message_count::int AS message_count
+      `SELECT id, COALESCE(name, subject) AS name, line, tracked, size, first_seen_at, last_message_at, message_count::int AS message_count
          FROM groups
-        WHERE ($1::text IS NULL OR name ILIKE '%' || $1 || '%' OR id ILIKE '%' || $1 || '%')
+        WHERE ($1::text IS NULL OR COALESCE(name, subject) ILIKE '%' || $1 || '%' OR id ILIKE '%' || $1 || '%')
         ORDER BY last_message_at DESC NULLS LAST
         LIMIT $2 OFFSET $3`,
       [search, limit, offset],
@@ -354,6 +389,16 @@ async function handleApi(req, res, url) {
     return;
   }
 
+  if (parts[1] === 'agents') {
+    await handleAgents(req, res, parts);
+    return;
+  }
+
+  if (parts[1] === 'sync') {
+    await handleSync(req, res, parts);
+    return;
+  }
+
   if (req.method === 'GET' && parts[1] === 'analytics') {
     await handleAnalytics(res, url, parts);
     return;
@@ -362,6 +407,226 @@ async function handleApi(req, res, url) {
   sendJson(res, 404, { error: 'not found' });
 }
 
+
+const AGENT_KEYS_SQL = `
+  agent_keys AS (
+    SELECT a.id AS agent_id, k.key
+      FROM agents a
+     CROSS JOIN LATERAL unnest(ARRAY[
+       COALESCE(a.lid, (SELECT lm.lid FROM lid_map lm WHERE lm.phone = a.phone ORDER BY lm.seen_at DESC LIMIT 1)),
+       a.phone || '@c.us',
+       a.phone || '@s.whatsapp.net'
+     ]) AS k(key)
+     WHERE k.key IS NOT NULL
+  ),
+  presence AS (
+    SELECT DISTINCT ak.agent_id, gm.group_id
+      FROM group_members gm
+      JOIN agent_keys ak ON ak.key = gm.member
+  ),
+  per_group AS (
+    SELECT group_id, count(*)::int AS agent_count FROM presence GROUP BY group_id
+  )`;
+
+function normalizePhone(value) {
+  let digits = String(value === undefined || value === null ? '' : value).replace(/\D/g, '');
+  if (digits.startsWith('00')) digits = digits.slice(2);
+  if (digits.startsWith('0') || digits.length < 8 || digits.length > 15) return null;
+  return digits;
+}
+
+async function readJson(req) {
+  const raw = await readBody(req);
+  try {
+    return JSON.parse(raw.toString('utf8'));
+  } catch (e) {
+    return null;
+  }
+}
+
+async function handleAgents(req, res, parts) {
+  if (req.method === 'GET' && parts.length === 2) {
+    const result = await pool.query(
+      `SELECT a.id, a.name, a.phone, a.lid AS manual_lid, a.created_at,
+              (a.lid IS NOT NULL OR EXISTS (SELECT 1 FROM lid_map lm WHERE lm.phone = a.phone)) AS id_known
+         FROM agents a ORDER BY a.name`,
+    );
+    sendJson(res, 200, { agents: result.rows });
+    return;
+  }
+
+  if (req.method === 'POST' && parts.length === 2) {
+    const data = await readJson(req);
+    if (!data) {
+      sendJson(res, 400, { error: 'bad json' });
+      return;
+    }
+    const rows = Array.isArray(data.agents) ? data.agents.slice(0, 500) : [data];
+    const saved = [];
+    const rejected = [];
+    for (let index = 0; index < rows.length; index++) {
+      const row = rows[index] || {};
+      const phone = normalizePhone(row.phone);
+      const name = typeof row.name === 'string' ? row.name.trim().slice(0, 100) : '';
+      if (!phone || !name) {
+        rejected.push({ index: index, reason: 'needs a name and a phone with country code, digits only' });
+        continue;
+      }
+      const result = await pool.query(
+        `INSERT INTO agents (name, phone) VALUES ($1, $2)
+         ON CONFLICT (phone) DO UPDATE SET name = EXCLUDED.name
+         RETURNING id, name, phone`,
+        [name, phone],
+      );
+      saved.push(result.rows[0]);
+    }
+    sendJson(res, saved.length > 0 ? 200 : 400, { saved: saved, rejected: rejected });
+    return;
+  }
+
+  if (req.method === 'PATCH' && parts.length === 3) {
+    const data = await readJson(req);
+    if (!data) {
+      sendJson(res, 400, { error: 'bad json' });
+      return;
+    }
+    const hasPhone = data.phone !== undefined;
+    const phone = hasPhone ? normalizePhone(data.phone) : null;
+    if (hasPhone && !phone) {
+      sendJson(res, 400, { error: 'invalid phone' });
+      return;
+    }
+    const hasLid = data.lid !== undefined;
+    if (hasLid && data.lid !== null && !(typeof data.lid === 'string' && data.lid.endsWith('@lid'))) {
+      sendJson(res, 400, { error: 'lid must end with @lid or be null' });
+      return;
+    }
+    const result = await pool.query(
+      `UPDATE agents
+          SET name = COALESCE($2, name),
+              phone = COALESCE($3, phone),
+              lid = CASE WHEN $4::boolean THEN $5 ELSE lid END
+        WHERE id = $1
+        RETURNING id, name, phone, lid AS manual_lid`,
+      [
+        parseInt(parts[2], 10) || 0,
+        typeof data.name === 'string' && data.name.trim() ? data.name.trim().slice(0, 100) : null,
+        phone,
+        hasLid,
+        hasLid ? data.lid : null,
+      ],
+    );
+    if (result.rows.length === 0) {
+      sendJson(res, 404, { error: 'not found' });
+      return;
+    }
+    sendJson(res, 200, result.rows[0]);
+    return;
+  }
+
+  if (req.method === 'DELETE' && parts.length === 3) {
+    const result = await pool.query('DELETE FROM agents WHERE id = $1', [parseInt(parts[2], 10) || 0]);
+    sendJson(res, 200, { deleted: result.rowCount });
+    return;
+  }
+
+  sendJson(res, 404, { error: 'not found' });
+}
+
+let syncing = false;
+let lastSync = { at: null, groups: 0, members: 0, error: null };
+
+async function syncGroups() {
+  if (!WAHA_API_KEY) throw new Error('WAHA_API_KEY is not set');
+  if (syncing) return null;
+  syncing = true;
+  const controller = new AbortController();
+  const timer = setTimeout(function () {
+    controller.abort();
+  }, 180000);
+  try {
+    const response = await fetch(WAHA_URL + '/api/' + WAHA_SESSION + '/groups', {
+      headers: { 'X-Api-Key': WAHA_API_KEY },
+      signal: controller.signal,
+    });
+    if (!response.ok) throw new Error('WAHA returned ' + response.status);
+    const data = await response.json();
+    const list = (Array.isArray(data) ? data : Object.values(data || {})).filter(function (group) {
+      return group && typeof group.id === 'string' && group.id.endsWith('@g.us');
+    });
+    if (list.length === 0) throw new Error('WAHA returned no groups; kept the existing data');
+
+    const client = await pool.connect();
+    let memberCount = 0;
+    try {
+      await client.query('BEGIN');
+      const ids = [];
+      for (const group of list) {
+        ids.push(group.id);
+        const participants = Array.isArray(group.participants) ? group.participants : [];
+        const members = [];
+        const admins = [];
+        for (const participant of participants) {
+          const id = typeof participant === 'string' ? participant : participant && participant.id;
+          if (typeof id !== 'string') continue;
+          members.push(id);
+          admins.push(Boolean(participant && participant.admin));
+        }
+        await client.query(
+          `INSERT INTO groups (id, subject, size, synced_at) VALUES ($1, $2, $3, now())
+           ON CONFLICT (id) DO UPDATE SET subject = EXCLUDED.subject, size = EXCLUDED.size, synced_at = now()`,
+          [group.id, typeof group.subject === 'string' ? group.subject.slice(0, 200) : null, Number.isFinite(group.size) ? group.size : members.length],
+        );
+        await client.query('DELETE FROM group_members WHERE group_id = $1', [group.id]);
+        if (members.length > 0) {
+          await client.query(
+            `INSERT INTO group_members (group_id, member, is_admin)
+             SELECT $1, t.m, t.a FROM unnest($2::text[], $3::boolean[]) AS t(m, a)
+             ON CONFLICT DO NOTHING`,
+            [group.id, members, admins],
+          );
+        }
+        memberCount += members.length;
+      }
+      await client.query('DELETE FROM group_members WHERE group_id <> ALL($1::text[])', [ids]);
+      await client.query('COMMIT');
+    } catch (e) {
+      await client.query('ROLLBACK');
+      throw e;
+    } finally {
+      client.release();
+    }
+    lastSync = { at: new Date().toISOString(), groups: list.length, members: memberCount, error: null };
+    console.log('group sync done:', list.length, 'groups,', memberCount, 'members');
+    return lastSync;
+  } catch (e) {
+    lastSync = Object.assign({}, lastSync, { error: e.message });
+    throw e;
+  } finally {
+    clearTimeout(timer);
+    syncing = false;
+  }
+}
+
+async function handleSync(req, res, parts) {
+  if (req.method === 'GET' && parts[2] === 'status') {
+    sendJson(res, 200, Object.assign({ running: syncing }, lastSync));
+    return;
+  }
+  if (req.method === 'POST' && parts.length === 2) {
+    if (syncing) {
+      sendJson(res, 409, { error: 'sync already running' });
+      return;
+    }
+    try {
+      sendJson(res, 200, await syncGroups());
+    } catch (e) {
+      sendJson(res, 502, { error: e.message });
+    }
+    return;
+  }
+  sendJson(res, 404, { error: 'not found' });
+}
 
 const TODAY_SQL = '(now() AT TIME ZONE $1)::date';
 
@@ -390,7 +655,7 @@ async function handleAnalytics(res, url, parts) {
   if (parts.length === 3 && parts[2] === 'top-groups') {
     const order = url.searchParams.get('order') === 'asc' ? 'ASC' : 'DESC';
     const result = await pool.query(
-      `SELECT g.id, g.name, g.last_message_at, COALESCE(s.messages, 0)::int AS messages
+      `SELECT g.id, COALESCE(g.name, g.subject) AS name, g.last_message_at, COALESCE(s.messages, 0)::int AS messages
          FROM groups g
          LEFT JOIN (
            SELECT group_id, sum(messages) AS messages
@@ -433,6 +698,94 @@ async function handleAnalytics(res, url, parts) {
     return;
   }
 
+  if (parts.length === 3 && parts[2] === 'agents') {
+    const summary = await pool.query(
+      `WITH ${AGENT_KEYS_SQL}
+       SELECT a.id, a.name, a.phone,
+              (a.lid IS NOT NULL OR EXISTS (SELECT 1 FROM lid_map lm WHERE lm.phone = a.phone)) AS id_known,
+              count(p.group_id)::int AS groups_total,
+              (count(p.group_id) FILTER (WHERE pg.agent_count = 1))::int AS solo,
+              (count(p.group_id) FILTER (WHERE pg.agent_count > 1))::int AS shared
+         FROM agents a
+         LEFT JOIN presence p ON p.agent_id = a.id
+         LEFT JOIN per_group pg ON pg.group_id = p.group_id
+        GROUP BY a.id
+        ORDER BY groups_total DESC, a.name`,
+    );
+    const partners = await pool.query(
+      `WITH ${AGENT_KEYS_SQL}
+       SELECT p1.agent_id, p2.agent_id AS other_id, a2.name AS other_name, count(*)::int AS groups
+         FROM presence p1
+         JOIN presence p2 ON p1.group_id = p2.group_id AND p1.agent_id <> p2.agent_id
+         JOIN agents a2 ON a2.id = p2.agent_id
+        GROUP BY p1.agent_id, p2.agent_id, a2.name
+        ORDER BY groups DESC`,
+    );
+    const totals = await pool.query(
+      `WITH ${AGENT_KEYS_SQL}
+       SELECT (SELECT count(*) FROM groups)::int AS total_groups,
+              (SELECT count(*) FROM per_group)::int AS groups_with_agents,
+              (SELECT count(*) FROM groups g WHERE NOT EXISTS (SELECT 1 FROM per_group pg WHERE pg.group_id = g.id))::int AS groups_without_agents,
+              (SELECT count(*) FROM per_group WHERE agent_count = 1)::int AS groups_with_one_agent,
+              (SELECT count(*) FROM per_group WHERE agent_count > 1)::int AS groups_with_several_agents,
+              (SELECT max(synced_at) FROM groups) AS last_sync`,
+    );
+    const agents = summary.rows.map(function (agent) {
+      return Object.assign({}, agent, {
+        shared_with: partners.rows
+          .filter(function (row) {
+            return row.agent_id === agent.id;
+          })
+          .map(function (row) {
+            return { agent_id: row.other_id, name: row.other_name, groups: row.groups };
+          }),
+      });
+    });
+    sendJson(res, 200, Object.assign({ agents: agents }, totals.rows[0]));
+    return;
+  }
+
+  if (parts.length === 5 && parts[2] === 'agents' && parts[4] === 'groups') {
+    const kind = url.searchParams.get('type');
+    const result = await pool.query(
+      `WITH ${AGENT_KEYS_SQL}
+       SELECT g.id, COALESCE(g.name, g.subject) AS name, g.size,
+              CASE WHEN pg.agent_count = 1 THEN 'solo' ELSE 'shared' END AS type,
+              COALESCE((SELECT array_agg(a2.name ORDER BY a2.name)
+                          FROM presence p2 JOIN agents a2 ON a2.id = p2.agent_id
+                         WHERE p2.group_id = g.id AND p2.agent_id <> $1), ARRAY[]::text[]) AS other_agents
+         FROM presence p
+         JOIN groups g ON g.id = p.group_id
+         JOIN per_group pg ON pg.group_id = g.id
+        WHERE p.agent_id = $1
+          AND ($2::text IS NULL OR (CASE WHEN pg.agent_count = 1 THEN 'solo' ELSE 'shared' END) = $2)
+        ORDER BY COALESCE(g.name, g.subject), g.id
+        LIMIT $3 OFFSET $4`,
+      [
+        parseInt(parts[3], 10) || 0,
+        kind === 'solo' || kind === 'shared' ? kind : null,
+        Math.max(1, intParam(url, 'limit', 100, 500)),
+        intParam(url, 'offset', 0, 1000000),
+      ],
+    );
+    sendJson(res, 200, { groups: result.rows });
+    return;
+  }
+
+  if (parts.length === 3 && parts[2] === 'groups-without-agents') {
+    const result = await pool.query(
+      `WITH ${AGENT_KEYS_SQL}
+       SELECT g.id, COALESCE(g.name, g.subject) AS name, g.size, g.last_message_at
+         FROM groups g
+        WHERE NOT EXISTS (SELECT 1 FROM per_group pg WHERE pg.group_id = g.id)
+        ORDER BY g.last_message_at DESC NULLS LAST, COALESCE(g.name, g.subject)
+        LIMIT $1 OFFSET $2`,
+      [Math.max(1, intParam(url, 'limit', 100, 500)), intParam(url, 'offset', 0, 1000000)],
+    );
+    sendJson(res, 200, { groups: result.rows });
+    return;
+  }
+
   if (parts.length === 3 && parts[2] === 'keywords') {
     const words = (url.searchParams.get('words') || '')
       .split(',')
@@ -464,13 +817,13 @@ async function handleAnalytics(res, url, parts) {
         base,
       );
       const topGroups = await pool.query(
-        `SELECT m.chat_id AS id, g.name, count(*)::int AS matches
+        `SELECT m.chat_id AS id, COALESCE(g.name, g.subject) AS name, count(*)::int AS matches
            FROM messages m LEFT JOIN groups g ON g.id = m.chat_id
           WHERE position(lower($1) in lower(m.body)) > 0
             AND m.group_id IS NOT NULL
             AND m.sent_at > now() - ($2::int || ' days')::interval
             AND ($3::text IS NULL OR m.chat_id = $3)
-          GROUP BY m.chat_id, g.name
+          GROUP BY m.chat_id, g.name, g.subject
           ORDER BY matches DESC
           LIMIT 5`,
         base.slice(0, 3),
@@ -562,11 +915,30 @@ pool
     return backfillDailyStats();
   })
   .then(function () {
+    return pool.query(
+      `INSERT INTO lid_map (lid, phone)
+       SELECT DISTINCT ON (sender_jid) sender_jid, sender_phone
+         FROM messages
+        WHERE sender_jid LIKE '%@lid' AND sender_phone IS NOT NULL
+        ORDER BY sender_jid, sent_at DESC
+       ON CONFLICT (lid) DO NOTHING`,
+    );
+  })
+  .then(function () {
     server.listen(PORT, function () {
       console.log('receiver listening on', PORT);
     });
     setInterval(cleanup, 6 * 60 * 60 * 1000);
     cleanup();
+    if (WAHA_API_KEY) {
+      const runSync = function () {
+        syncGroups().catch(function (e) {
+          console.error('group sync failed:', e.message);
+        });
+      };
+      setTimeout(runSync, 20000);
+      setInterval(runSync, SYNC_HOURS * 60 * 60 * 1000);
+    }
   })
   .catch(function (e) {
     console.error('database setup failed', e.message);
