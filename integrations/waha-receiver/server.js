@@ -14,6 +14,7 @@ const RETENTION_DAYS = Number(process.env.RETENTION_DAYS || 90);
 const MAX_BODY_BYTES = 1024 * 1024;
 const MAX_TEXT_CHARS = 4000;
 const STORE_DIRECT_CHATS = process.env.STORE_DIRECT_CHATS === 'true';
+const ANALYTICS_TZ = process.env.ANALYTICS_TZ || 'Africa/Cairo';
 
 if (!DATABASE_URL || !HMAC_KEY || !READ_API_KEY) {
   console.error('Missing env: DATABASE_URL, WAHA_HMAC_KEY and READ_API_KEY are required');
@@ -48,6 +49,12 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 CREATE INDEX IF NOT EXISTS messages_chat_sent_idx ON messages (chat_id, sent_at DESC);
 CREATE INDEX IF NOT EXISTS messages_sent_idx ON messages (sent_at);
+CREATE TABLE IF NOT EXISTS daily_group_stats (
+  day date NOT NULL,
+  group_id text NOT NULL,
+  messages integer NOT NULL DEFAULT 0,
+  PRIMARY KEY (day, group_id)
+);
 CREATE TABLE IF NOT EXISTS leads (
   phone text PRIMARY KEY,
   created_at timestamptz NOT NULL DEFAULT now()
@@ -204,6 +211,12 @@ async function handleMessageEvent(event, line) {
 
   if (isGroup) {
     await pool.query(
+      `INSERT INTO daily_group_stats (day, group_id, messages)
+       VALUES ((($1::timestamptz) AT TIME ZONE $2)::date, $3, 1)
+       ON CONFLICT (day, group_id) DO UPDATE SET messages = daily_group_stats.messages + 1`,
+      [sentAt, ANALYTICS_TZ, chatId],
+    );
+    await pool.query(
       'UPDATE groups SET last_message_at = GREATEST(COALESCE(last_message_at, $2), $2), message_count = message_count + 1 WHERE id = $1',
       [chatId, sentAt],
     );
@@ -329,6 +342,7 @@ async function handleApi(req, res, url) {
 
   if (req.method === 'DELETE' && parts.length === 4 && parts[1] === 'groups' && parts[3] === 'messages') {
     const result = await pool.query('DELETE FROM messages WHERE chat_id = $1', [parts[2]]);
+    await pool.query('DELETE FROM daily_group_stats WHERE group_id = $1', [parts[2]]);
     await pool.query('UPDATE groups SET message_count = 0, last_message_at = NULL WHERE id = $1', [parts[2]]);
     sendJson(res, 200, { deleted: result.rowCount });
     return;
@@ -337,6 +351,139 @@ async function handleApi(req, res, url) {
   if (req.method === 'GET' && parts.length === 4 && parts[1] === 'chats' && parts[3] === 'messages') {
     const digits = parts[2].replace(/[^0-9]/g, '');
     sendJson(res, 200, { messages: await listMessages(digits + '@c.us', url) });
+    return;
+  }
+
+  if (req.method === 'GET' && parts[1] === 'analytics') {
+    await handleAnalytics(res, url, parts);
+    return;
+  }
+
+  sendJson(res, 404, { error: 'not found' });
+}
+
+
+const TODAY_SQL = '(now() AT TIME ZONE $1)::date';
+
+async function handleAnalytics(res, url, parts) {
+  const days = Math.max(1, intParam(url, 'days', 7, 365));
+  const limit = Math.max(1, intParam(url, 'limit', 20, 100));
+
+  if (parts.length === 3 && parts[2] === 'overview') {
+    const result = await pool.query(
+      `SELECT
+         (SELECT count(*) FROM groups)::int AS total_groups,
+         (SELECT count(*) FROM groups WHERE tracked)::int AS tracked_groups,
+         (SELECT count(*) FROM groups WHERE last_message_at > now() - interval '24 hours')::int AS active_groups_24h,
+         COALESCE((SELECT sum(messages) FROM daily_group_stats WHERE day = ${TODAY_SQL}), 0)::int AS messages_today,
+         COALESCE((SELECT sum(messages) FROM daily_group_stats WHERE day > ${TODAY_SQL} - 7), 0)::int AS messages_7d,
+         COALESCE((SELECT sum(messages) FROM daily_group_stats WHERE day > ${TODAY_SQL} - 30), 0)::int AS messages_30d,
+         COALESCE((SELECT sum(messages) FROM daily_group_stats), 0)::int AS messages_all_time,
+         (SELECT count(*) FROM messages WHERE group_id IS NOT NULL)::int AS messages_stored,
+         (SELECT min(sent_at) FROM messages WHERE group_id IS NOT NULL) AS oldest_stored_message`,
+      [ANALYTICS_TZ],
+    );
+    sendJson(res, 200, Object.assign({ timezone: ANALYTICS_TZ, retention_days: RETENTION_DAYS }, result.rows[0]));
+    return;
+  }
+
+  if (parts.length === 3 && parts[2] === 'top-groups') {
+    const order = url.searchParams.get('order') === 'asc' ? 'ASC' : 'DESC';
+    const result = await pool.query(
+      `SELECT g.id, g.name, g.last_message_at, COALESCE(s.messages, 0)::int AS messages
+         FROM groups g
+         LEFT JOIN (
+           SELECT group_id, sum(messages) AS messages
+             FROM daily_group_stats
+            WHERE day > ${TODAY_SQL} - $2::int
+            GROUP BY group_id
+         ) s ON s.group_id = g.id
+        WHERE g.tracked
+        ORDER BY COALESCE(s.messages, 0) ${order}, g.last_message_at DESC NULLS LAST
+        LIMIT $3`,
+      [ANALYTICS_TZ, days, limit],
+    );
+    sendJson(res, 200, { days: days, order: order.toLowerCase(), groups: result.rows });
+    return;
+  }
+
+  if (parts.length === 5 && parts[2] === 'groups' && parts[4] === 'top-senders') {
+    const groupId = parts[3];
+    const senders = await pool.query(
+      `SELECT COALESCE(sender_phone, sender_jid, 'unknown') AS sender,
+              (array_agg(sender_name ORDER BY sent_at DESC) FILTER (WHERE sender_name IS NOT NULL))[1] AS name,
+              count(*)::int AS messages,
+              max(sent_at) AS last_seen
+         FROM messages
+        WHERE chat_id = $1
+          AND sent_at > now() - ($2::int || ' days')::interval
+        GROUP BY COALESCE(sender_phone, sender_jid, 'unknown')
+        ORDER BY messages DESC, last_seen DESC
+        LIMIT $3`,
+      [groupId, days, limit],
+    );
+    const totals = await pool.query(
+      `SELECT count(*)::int AS total_messages,
+              count(DISTINCT COALESCE(sender_phone, sender_jid, 'unknown'))::int AS distinct_senders
+         FROM messages
+        WHERE chat_id = $1 AND sent_at > now() - ($2::int || ' days')::interval`,
+      [groupId, days],
+    );
+    sendJson(res, 200, Object.assign({ days: days, senders: senders.rows }, totals.rows[0]));
+    return;
+  }
+
+  if (parts.length === 3 && parts[2] === 'keywords') {
+    const words = (url.searchParams.get('words') || '')
+      .split(',')
+      .map(function (word) {
+        return word.trim().slice(0, 50);
+      })
+      .filter(Boolean)
+      .slice(0, 10);
+    if (words.length === 0) {
+      sendJson(res, 400, { error: 'pass words=word1,word2' });
+      return;
+    }
+    const groupId = url.searchParams.get('group_id');
+    const out = [];
+    for (const word of words) {
+      const base = [word, days, groupId, ANALYTICS_TZ];
+      const filter = `position(lower($1) in lower(body)) > 0
+        AND group_id IS NOT NULL
+        AND sent_at > now() - ($2::int || ' days')::interval
+        AND ($3::text IS NULL OR chat_id = $3)`;
+      const total = await pool.query(
+        `SELECT count(*)::int AS matches, count(DISTINCT chat_id)::int AS groups FROM messages WHERE ${filter}`,
+        base.slice(0, 3),
+      );
+      const perDay = await pool.query(
+        `SELECT ((sent_at AT TIME ZONE $4)::date)::text AS day, count(*)::int AS matches
+           FROM messages WHERE ${filter}
+          GROUP BY 1 ORDER BY 1`,
+        base,
+      );
+      const topGroups = await pool.query(
+        `SELECT m.chat_id AS id, g.name, count(*)::int AS matches
+           FROM messages m LEFT JOIN groups g ON g.id = m.chat_id
+          WHERE position(lower($1) in lower(m.body)) > 0
+            AND m.group_id IS NOT NULL
+            AND m.sent_at > now() - ($2::int || ' days')::interval
+            AND ($3::text IS NULL OR m.chat_id = $3)
+          GROUP BY m.chat_id, g.name
+          ORDER BY matches DESC
+          LIMIT 5`,
+        base.slice(0, 3),
+      );
+      out.push({
+        keyword: word,
+        matches: total.rows[0].matches,
+        groups: total.rows[0].groups,
+        per_day: perDay.rows,
+        top_groups: topGroups.rows,
+      });
+    }
+    sendJson(res, 200, { days: days, timezone: ANALYTICS_TZ, keywords: out });
     return;
   }
 
@@ -393,8 +540,27 @@ const server = http.createServer(function (req, res) {
   });
 });
 
+async function backfillDailyStats() {
+  const existing = await pool.query('SELECT 1 FROM daily_group_stats LIMIT 1');
+  if (existing.rows.length > 0) return;
+  await pool.query(
+    `INSERT INTO daily_group_stats (day, group_id, messages)
+     SELECT (sent_at AT TIME ZONE $1)::date, group_id, count(*)
+       FROM messages WHERE group_id IS NOT NULL
+      GROUP BY 1, 2
+     ON CONFLICT (day, group_id) DO NOTHING`,
+    [ANALYTICS_TZ],
+  );
+}
+
 pool
   .query(SCHEMA)
+  .then(function () {
+    return pool.query('SELECT now() AT TIME ZONE $1', [ANALYTICS_TZ]);
+  })
+  .then(function () {
+    return backfillDailyStats();
+  })
   .then(function () {
     server.listen(PORT, function () {
       console.log('receiver listening on', PORT);
