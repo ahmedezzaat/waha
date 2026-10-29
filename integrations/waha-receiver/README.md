@@ -6,7 +6,7 @@ a small read API protected by `READ_API_KEY`.
 
 Endpoints (all JSON):
 
-- `POST /webhook?line=NAME` - WAHA webhook, signed with HMAC (`WAHA_HMAC_KEY`)
+- `POST /webhook?line=NAME` - WAHA webhook, signed with HMAC (`WAHA_HMAC_KEY`). Accepts the `message` event (incoming) and `message.any` (also messages sent from the linked number); duplicates are ignored by message id
 - `GET /health`
 - `GET /api/groups?limit&offset&q`
 - `PATCH /api/groups/:id` with `{"name": "...", "tracked": true|false}`

@@ -205,6 +205,14 @@ async function handleMessageEvent(event, line) {
     senderPhone = firstPhone([payload.from, key.remoteJidAlt, key.senderPn]);
   }
 
+  if (fromMe && event.me && typeof event.me.lid === 'string' && event.me.lid.endsWith('@lid') && senderPhone) {
+    await pool.query(
+      `INSERT INTO lid_map (lid, phone) VALUES ($1, $2)
+       ON CONFLICT (lid) DO UPDATE SET phone = EXCLUDED.phone, seen_at = now()`,
+      [event.me.lid, senderPhone],
+    );
+  }
+
   if (senderJid && senderJid.endsWith('@lid') && senderPhone) {
     await pool.query(
       `INSERT INTO lid_map (lid, phone) VALUES ($1, $2)
@@ -292,7 +300,7 @@ async function handleWebhook(req, res, url) {
     sendJson(res, 400, { ok: false, error: 'bad json' });
     return;
   }
-  if (event.event !== 'message') {
+  if (event.event !== 'message' && event.event !== 'message.any') {
     sendJson(res, 200, { ok: true, action: 'ignored' });
     return;
   }
